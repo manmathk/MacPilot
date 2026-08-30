@@ -76,6 +76,10 @@ final class AXRuntime {
     }
 }
 
+private final class ApplicationBox: @unchecked Sendable {
+    var app: NSRunningApplication?
+}
+
 enum WindowManager {
     static var isAccessibilityTrusted: Bool { AXIsProcessTrusted() }
 
@@ -140,20 +144,14 @@ enum WindowManager {
             return "Accessibility permission is required to move windows"
         }
         let apps = NSWorkspace.shared.runningApplications.filter { $0.activationPolicy == .regular }
-        guard let app = apps.first(where: { ($0.localizedName ?? "").localizedCaseInsensitiveContains(name) }) else {
-            return "Couldn't find \(name)"
-        }
+        guard let app = apps.first(where: { ($0.localizedName ?? "").localizedCaseInsensitiveContains(name) }) else { return "Couldn't find \(name)" }
         let screens = NSScreen.screens
         guard monitor > 0 && monitor <= screens.count else { return "Monitor \(monitor) isn't available" }
         let target = screens[monitor - 1].visibleFrame
         let axApp = AXUIElementCreateApplication(app.processIdentifier)
-        guard let windows = attribute(axApp, kAXWindowsAttribute) as? [AXUIElement], let window = windows.first else {
-            return "Couldn't access \(name)'s window"
-        }
+        guard let windows = attribute(axApp, kAXWindowsAttribute) as? [AXUIElement], let window = windows.first else { return "Couldn't access \(name)'s window" }
         var point = CGPoint(x: target.minX + 24, y: target.maxY - 24 - min(target.height * 0.8, 720))
-        guard let position = AXValueCreate(.cgPoint, &point), AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, position) == .success else {
-            return "Couldn't move \(name)'s window"
-        }
+        guard let position = AXValueCreate(.cgPoint, &point), AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, position) == .success else { return "Couldn't move \(name)'s window" }
         app.activate(options: [.activateIgnoringOtherApps])
         return "Moved \(name) to monitor \(monitor)"
     }
@@ -162,15 +160,15 @@ enum WindowManager {
         if let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first { return app }
         guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else { return nil }
         let semaphore = DispatchSemaphore(value: 0)
-        var launched: NSRunningApplication?
+        let box = ApplicationBox()
         let config = NSWorkspace.OpenConfiguration()
         config.activates = true
         NSWorkspace.shared.openApplication(at: url, configuration: config) { app, _ in
-            launched = app
+            box.app = app
             semaphore.signal()
         }
         semaphore.wait()
-        return launched
+        return box.app
     }
 
     private static func score(_ window: AXUIElement, _ desired: WindowSnapshot) -> Double {
@@ -181,7 +179,9 @@ enum WindowManager {
     }
 
     private static func frame(of element: AXUIElement) -> CGRect? {
-        guard let position = attribute(element, kAXPositionAttribute), let size = attribute(element, kAXSizeAttribute) else { return nil }
+        guard let rawPosition = attribute(element, kAXPositionAttribute), let rawSize = attribute(element, kAXSizeAttribute) else { return nil }
+        let position = rawPosition as! AXValue
+        let size = rawSize as! AXValue
         var point = CGPoint.zero
         var dimensions = CGSize.zero
         guard AXValueGetValue(position, .cgPoint, &point), AXValueGetValue(size, .cgSize, &dimensions) else { return nil }
@@ -262,7 +262,6 @@ enum FinderService {
 
 enum StorageService {
     struct VolumeInfo { let total: Int64; let free: Int64 }
-
     static func volumeInfo() -> VolumeInfo {
         let attrs = (try? FileManager.default.attributesOfFileSystem(forPath: "/")) ?? [:]
         return .init(total: (attrs[.systemSize] as? NSNumber)?.int64Value ?? 0, free: (attrs[.systemFreeSize] as? NSNumber)?.int64Value ?? 0)
