@@ -2,6 +2,7 @@ import AppKit
 import SwiftUI
 import Combine
 
+@main
 struct MacPilotApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
@@ -13,6 +14,7 @@ struct MacPilotApp: App {
     }
 }
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var panelController: CommandPanelController!
@@ -30,16 +32,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.button?.image = NSImage(systemSymbolName: "scope", accessibilityDescription: "MacPilot")
         statusItem.menu = NSMenu()
+
         let open = NSMenuItem(title: "Open MacPilot", action: #selector(togglePanel), keyEquivalent: "")
         open.target = self
         statusItem.menu?.addItem(open)
+
         let workspace = NSMenuItem(title: "Save Workspace…", action: #selector(saveWorkspace), keyEquivalent: "")
         workspace.target = self
         statusItem.menu?.addItem(workspace)
+
         statusItem.menu?.addItem(.separator())
+
         let settings = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
         settings.target = self
         statusItem.menu?.addItem(settings)
+
         let quit = NSMenuItem(title: "Quit MacPilot", action: #selector(quit), keyEquivalent: "q")
         quit.target = self
         statusItem.menu?.addItem(quit)
@@ -60,22 +67,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    @MainActor @objc private func togglePanel() { panelController.toggle() }
-    @MainActor @objc private func saveWorkspace() { panelController.presentSaveWorkspace() }
-    @MainActor @objc private func openSettings() {
-        NSApp.activate(ignoringOtherApps: true)
-        NotificationCenter.default.post(name: .openMacPilotSettings, object: nil)
-    }
-    @MainActor @objc private func quit() { NSApp.terminate(nil) }
+    @objc private func togglePanel() { panelController.toggle() }
+    @objc private func saveWorkspace() { panelController.presentSaveWorkspace() }
+    @objc private func openSettings() { panelController.openSettings() }
+    @objc private func quit() { NSApp.terminate(nil) }
 
     func applicationWillTerminate(_ notification: Notification) {
         if let monitor = globalHotKeyMonitor { NSEvent.removeMonitor(monitor) }
         if let monitor = localHotKeyMonitor { NSEvent.removeMonitor(monitor) }
     }
-}
-
-extension Notification.Name {
-    static let openMacPilotSettings = Notification.Name("MacPilot.openSettings")
 }
 
 @MainActor
@@ -99,7 +99,11 @@ final class CommandPanelController: NSObject {
     }
 
     func toggle() {
-        if panel.isVisible { panel.orderOut(nil) } else { show() }
+        if panel.isVisible {
+            panel.orderOut(nil)
+        } else {
+            show()
+        }
     }
 
     func show() {
@@ -111,25 +115,54 @@ final class CommandPanelController: NSObject {
         }
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
-        panel.makeFirstResponder(panel.contentView)
     }
 
     func presentSaveWorkspace() {
         show()
         model.query = "Create workspace called "
     }
+
+    func openSettings() {
+        SettingsWindowController.shared.show()
+    }
+}
+
+@MainActor
+final class SettingsWindowController: NSObject {
+    static let shared = SettingsWindowController()
+    private var window: NSWindow?
+
+    func show() {
+        if window == nil {
+            let hosting = NSHostingView(rootView: SettingsView().frame(width: 560, height: 460))
+            let created = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 460), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            created.title = "MacPilot Settings"
+            created.contentView = hosting
+            created.center()
+            window = created
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
+    }
 }
 
 @MainActor
 final class CommandModel: ObservableObject {
     struct Command: Identifiable {
-        let id = UUID(); let title: String; let subtitle: String; let icon: String; let category: String; let action: () -> Void
+        let id = UUID()
+        let title: String
+        let subtitle: String
+        let icon: String
+        let category: String
+        let action: @MainActor () -> Void
     }
+
     @Published var query = ""
     @Published var message: String?
     @Published var isBusy = false
     @Published var lastStorage: StorageService.VolumeInfo?
     @Published var workspaceCount = 0
+
     private let workspaceStore = WorkspaceStore()
     private(set) var commands: [Command] = []
 
@@ -139,11 +172,10 @@ final class CommandModel: ObservableObject {
             Command(title: "Create Workspace from Current Setup", subtitle: "Capture apps, windows, sizes and positions", icon: "square.and.arrow.down", category: "Workspaces") { [weak self] in self?.saveWorkspace() },
             Command(title: "Open Terminal Here", subtitle: "Use the frontmost Finder folder", icon: "terminal", category: "Finder") { [weak self] in self?.openTerminalHere() },
             Command(title: "Copy Selected File Path", subtitle: "Copy the selected Finder item path", icon: "link", category: "Finder") { [weak self] in self?.copyPath() },
-            Command(title: "Show Storage", subtitle: "Inspect disk capacity and top-level usage", icon: "internaldrive", category: "System") { [weak self] in self?.showStorage() },
+            Command(title: "Show Storage", subtitle: "Inspect disk capacity", icon: "internaldrive", category: "System") { [weak self] in self?.showStorage() },
             Command(title: "Accessibility Permission", subtitle: "Allow MacPilot to control windows", icon: "hand.raised", category: "System") { WindowManager.requestAccessibility() },
             Command(title: "Open Settings", subtitle: "Configure MacPilot", icon: "gearshape", category: "System") { [weak self] in self?.openSettings() }
         ]
-        NotificationCenter.default.addObserver(forName: .openMacPilotSettings, object: nil, queue: .main) { [weak self] _ in self?.openSettings() }
     }
 
     var filtered: [Command] {
@@ -157,55 +189,123 @@ final class CommandModel: ObservableObject {
     }
 
     var parsedIntent: IntentParser.Intent { IntentParser.parse(query) }
-    func beginSession() { query = ""; message = nil; isBusy = false; workspaceCount = workspaceStore.workspaces.count }
+
+    func beginSession() {
+        query = ""
+        message = nil
+        isBusy = false
+        workspaceCount = workspaceStore.workspaces.count
+    }
+
     func executeFirst() {
         switch parsedIntent {
         case .restore(let name): restoreWorkspace(name: name)
         case .save(let name): saveWorkspace(name: name)
         case .moveApp(let appName, let monitor): moveApp(named: appName, toMonitor: monitor)
-        case .terminal: openTerminalHere(); case .copyPath: copyPath(); case .storage: showStorage(); case .settings: openSettings(); case .accessibility: WindowManager.requestAccessibility(); case .unknown: filtered.first?.action()
+        case .terminal: openTerminalHere()
+        case .copyPath: copyPath()
+        case .storage: showStorage()
+        case .settings: openSettings()
+        case .accessibility: WindowManager.requestAccessibility()
+        case .unknown: filtered.first?.action()
         }
     }
+
     private func restoreWorkspace(name: String? = nil) {
-        guard let workspace = workspaceStore.workspaces.first(where: { name == nil || $0.name.caseInsensitiveCompare(name!) == .orderedSame }) ?? workspaceStore.workspaces.first else { message = "No saved workspaces yet"; return }
-        guard WindowManager.isAccessibilityTrusted else { message = "Accessibility permission is required to restore windows"; WindowManager.requestAccessibility(); return }
-        isBusy = true
-        Task { [weak self] in
-            guard let self else { return }
-            let result = await self.workspaceStore.restore(workspace)
-            self.message = result.offscreen > 0 ? "Restored \(result.restored); \(result.offscreen) moved back on-screen" : (result.failed == 0 ? "Restored \(result.restored) windows" : "Restored \(result.restored), \(result.failed) could not be restored")
-            self.isBusy = false
+        guard let workspace = workspaceStore.workspaces.first(where: { name == nil || $0.name.caseInsensitiveCompare(name!) == .orderedSame }) ?? workspaceStore.workspaces.first else {
+            message = "No saved workspaces yet"
+            return
         }
+        guard WindowManager.isAccessibilityTrusted else {
+            message = "Accessibility permission is required to restore windows"
+            WindowManager.requestAccessibility()
+            return
+        }
+        isBusy = true
+        let result = workspaceStore.restore(workspace)
+        message = result.offscreen > 0 ? "Restored \(result.restored); \(result.offscreen) moved back on-screen" : (result.failed == 0 ? "Restored \(result.restored) windows" : "Restored \(result.restored), \(result.failed) could not be restored")
+        isBusy = false
     }
+
     private func saveWorkspace(name: String? = nil) {
         let workspaceName = (name?.isEmpty == false ? name! : "Workspace \(workspaceStore.workspaces.count + 1)").trimmingCharacters(in: .whitespaces)
-        guard WindowManager.isAccessibilityTrusted else { message = "Accessibility permission is required to capture windows"; WindowManager.requestAccessibility(); return }
+        guard WindowManager.isAccessibilityTrusted else {
+            message = "Accessibility permission is required to capture windows"
+            WindowManager.requestAccessibility()
+            return
+        }
         let snapshot = workspaceStore.saveCurrent(named: workspaceName)
         workspaceCount = workspaceStore.workspaces.count
         message = snapshot.windows.isEmpty ? "Saved, but no accessible windows were captured" : "Saved \(snapshot.windows.count) windows as \(workspaceName)"
     }
+
     private func openTerminalHere() { message = FinderService.openTerminalHere() ? "Terminal opened in Finder's current folder" : "Couldn't read the frontmost Finder folder" }
     private func copyPath() { message = FinderService.copySelectedPath().map { "Copied \($0)" } ?? "Select a file or folder in Finder first" }
     private func showStorage() { lastStorage = StorageService.volumeInfo(); guard let storage = lastStorage else { message = "Storage information unavailable"; return }; message = "\(ByteCountFormatter.string(fromByteCount: storage.free, countStyle: .file)) free of \(ByteCountFormatter.string(fromByteCount: storage.total, countStyle: .file))" }
     private func moveApp(named name: String, toMonitor monitor: Int) { message = WindowManager.moveApp(named: name, toMonitor: monitor) }
-    private func openSettings() { NotificationCenter.default.post(name: .openMacPilotSettingsUI, object: nil) }
+    private func openSettings() { SettingsWindowController.shared.show() }
 }
-
-extension Notification.Name { static let openMacPilotSettingsUI = Notification.Name("MacPilot.openSettingsUI") }
 
 struct CommandPaletteView: View {
     @ObservedObject var model: CommandModel
     @FocusState private var focused: Bool
+
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
-                Image(systemName: model.isBusy ? "arrow.triangle.2.circlepath" : "scope").font(.system(size: 18, weight: .semibold)).foregroundStyle(.secondary)
-                TextField("What do you want to do?", text: $model.query).textFieldStyle(.plain).font(.system(size: 20)).focused($focused).onSubmit { model.executeFirst() }
-                Text("⌘⇧Space").font(.caption.monospaced()).foregroundStyle(.tertiary)
-            }.padding(18)
+                Image(systemName: model.isBusy ? "arrow.triangle.2.circlepath" : "scope")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                TextField("What do you want to do?", text: $model.query)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 20))
+                    .focused($focused)
+                    .onSubmit { model.executeFirst() }
+                Text("⌘⇧Space")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(18)
+
             Divider()
-            commandList.frame(maxHeight: .infinity)
-            if let message = model.message { Divider(); HStack(spacing: 8) { Image(systemName: message.lowercased().contains("couldn't") ? "exclamationmark.circle" : "checkmark.circle.fill"); Text(message).lineLimit(2); Spacer() }.font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary).padding(12) }
+
+            ScrollView {
+                LazyVStack(spacing: 4) {
+                    ForEach(model.filtered) { command in
+                        Button(action: command.action) {
+                            HStack(spacing: 14) {
+                                Image(systemName: command.icon)
+                                    .frame(width: 30)
+                                    .font(.system(size: 15, weight: .semibold))
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(command.title).font(.system(size: 14, weight: .medium))
+                                    Text(command.subtitle).font(.system(size: 12)).foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Text(command.category).font(.caption).foregroundStyle(.tertiary)
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 9)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(8)
+            }
+            .frame(maxHeight: .infinity)
+
+            if let message = model.message {
+                Divider()
+                HStack(spacing: 8) {
+                    Image(systemName: message.lowercased().contains("couldn't") ? "exclamationmark.circle" : "checkmark.circle.fill")
+                    Text(message).lineLimit(2)
+                    Spacer()
+                }
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.secondary)
+                .padding(12)
+            }
         }
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
@@ -213,10 +313,26 @@ struct CommandPaletteView: View {
         .shadow(radius: 30, y: 14)
         .onAppear { focused = true }
     }
-    private var commandList: some View { ScrollView { LazyVStack(spacing: 4) { ForEach(model.filtered) { command in Button(action: command.action) { HStack(spacing: 14) { Image(systemName: command.icon).frame(width: 30).font(.system(size: 15, weight: .semibold)); VStack(alignment: .leading, spacing: 3) { Text(command.title).font(.system(size: 14, weight: .medium)); Text(command.subtitle).font(.system(size: 12)).foregroundStyle(.secondary) }; Spacer(); Text(command.category).font(.caption).foregroundStyle(.tertiary) }.padding(.horizontal, 12).padding(.vertical, 9).contentShape(Rectangle()) }.buttonStyle(.plain) } }.padding(8) } }
 }
 
-struct StorageCard: View { let storage: StorageService.VolumeInfo; var body: some View { Text(ByteCountFormatter.string(fromByteCount: storage.free, countStyle: .file) + " free") } }
-struct SettingsView: View { var body: some View { Form { Section("MacPilot") { LabeledContent("Global shortcut", value: "⌘⇧Space"); LabeledContent("Architecture", value: "Native SwiftUI + AppKit"); LabeledContent("Version", value: "0.2 MVP") }; Section("Permissions") { Text("Accessibility access lets MacPilot capture, move and restore application windows.").foregroundStyle(.secondary); Button("Request Accessibility Access") { WindowManager.requestAccessibility() } }; Section("Privacy") { Text("Workspace snapshots are stored locally.").foregroundStyle(.secondary) } }.padding(20) } }
-
-// The remaining application logic stays in Core.swift.
+struct SettingsView: View {
+    var body: some View {
+        Form {
+            Section("MacPilot") {
+                LabeledContent("Global shortcut", value: "⌘⇧Space")
+                LabeledContent("Architecture", value: "Native SwiftUI + AppKit")
+                LabeledContent("Version", value: "0.2 MVP")
+            }
+            Section("Permissions") {
+                Text("Accessibility access lets MacPilot capture, move and restore application windows.")
+                    .foregroundStyle(.secondary)
+                Button("Request Accessibility Access") { WindowManager.requestAccessibility() }
+            }
+            Section("Privacy") {
+                Text("Workspace snapshots are stored locally.")
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(20)
+    }
+}
