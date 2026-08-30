@@ -25,6 +25,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
         setupMenuBar()
         panelController = CommandPanelController()
+        _ = AutomationEngine.shared
         installHotKey()
     }
 
@@ -32,19 +33,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.button?.image = NSImage(systemSymbolName: "scope", accessibilityDescription: "MacPilot")
         statusItem.menu = NSMenu()
-        let open = NSMenuItem(title: "Open MacPilot", action: #selector(togglePanel), keyEquivalent: "")
-        open.target = self
-        statusItem.menu?.addItem(open)
-        let workspace = NSMenuItem(title: "Save Workspace…", action: #selector(saveWorkspace), keyEquivalent: "")
-        workspace.target = self
-        statusItem.menu?.addItem(workspace)
+
+        addMenuItem("Open MacPilot", action: #selector(togglePanel))
+        addMenuItem("Control Center…", action: #selector(openControlCenter))
+        addMenuItem("Save Workspace…", action: #selector(saveWorkspace))
         statusItem.menu?.addItem(.separator())
-        let settings = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
-        settings.target = self
-        statusItem.menu?.addItem(settings)
-        let quit = NSMenuItem(title: "Quit MacPilot", action: #selector(quit), keyEquivalent: "q")
-        quit.target = self
-        statusItem.menu?.addItem(quit)
+        addMenuItem("Settings…", action: #selector(openSettings))
+        addMenuItem("Quit MacPilot", action: #selector(quit), keyEquivalent: "q")
+    }
+
+    private func addMenuItem(_ title: String, action: Selector, keyEquivalent: String = "") {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: keyEquivalent)
+        item.target = self
+        statusItem.menu?.addItem(item)
     }
 
     private func installHotKey() {
@@ -57,12 +58,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         localHotKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
             handler(event)
             let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-            if flags.contains([.command, .shift]), event.keyCode == 49 { return nil }
-            return event
+            return flags.contains([.command, .shift]) && event.keyCode == 49 ? nil : event
         }
     }
 
     @objc private func togglePanel() { panelController.toggle() }
+    @objc private func openControlCenter() { ControlCenterController.shared.show() }
     @objc private func saveWorkspace() { panelController.presentSaveWorkspace() }
     @objc private func openSettings() { panelController.openSettings() }
     @objc private func quit() { NSApp.terminate(nil) }
@@ -77,6 +78,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 final class CommandPanelController: NSObject {
     private let panel: NSPanel
     private let model: CommandModel
+    private var observer: NSObjectProtocol?
 
     override init() {
         model = CommandModel()
@@ -91,6 +93,9 @@ final class CommandPanelController: NSObject {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.isMovableByWindowBackground = true
         panel.contentView = NSHostingView(rootView: CommandPaletteView(model: model))
+        observer = NotificationCenter.default.addObserver(forName: .openMacPilotCommandPalette, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.show() }
+        }
     }
 
     func toggle() {
@@ -114,6 +119,10 @@ final class CommandPanelController: NSObject {
     }
 
     func openSettings() { SettingsWindowController.shared.show() }
+
+    deinit {
+        if let observer { NotificationCenter.default.removeObserver(observer) }
+    }
 }
 
 @MainActor
@@ -124,10 +133,11 @@ final class SettingsWindowController: NSObject {
     func show() {
         if window == nil {
             let hosting = NSHostingView(rootView: SettingsView().frame(width: 560, height: 460))
-            let created = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 460), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            let created = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 460), styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
             created.title = "MacPilot Settings"
             created.contentView = hosting
             created.center()
+            created.isReleasedWhenClosed = false
             window = created
         }
         NSApp.activate(ignoringOtherApps: true)
@@ -151,7 +161,6 @@ final class CommandModel: ObservableObject {
     @Published var isBusy = false
     @Published var lastStorage: StorageService.VolumeInfo?
     @Published var workspaceCount = 0
-
     private let workspaceStore = WorkspaceStore()
     private(set) var commands: [Command] = []
 
@@ -159,9 +168,15 @@ final class CommandModel: ObservableObject {
         commands = [
             Command(title: "Restore Workspace", subtitle: "Restore a saved window arrangement", icon: "rectangle.3.group", category: "Workspaces") { [weak self] in self?.restoreWorkspace() },
             Command(title: "Create Workspace from Current Setup", subtitle: "Capture apps, windows, sizes and positions", icon: "square.and.arrow.down", category: "Workspaces") { [weak self] in self?.saveWorkspace() },
+            Command(title: "Move App to Monitor", subtitle: "Move a running app to another display", icon: "rectangle.split.3x1", category: "Windows") { [weak self] in self?.message = "Try: Move Chrome to monitor 2" },
             Command(title: "Open Terminal Here", subtitle: "Use the frontmost Finder folder", icon: "terminal", category: "Finder") { [weak self] in self?.openTerminalHere() },
             Command(title: "Copy Selected File Path", subtitle: "Copy the selected Finder item path", icon: "link", category: "Finder") { [weak self] in self?.copyPath() },
-            Command(title: "Show Storage", subtitle: "Inspect disk capacity", icon: "internaldrive", category: "System") { [weak self] in self?.showStorage() },
+            Command(title: "New Finder File", subtitle: "Create a file in the current Finder folder", icon: "doc.badge.plus", category: "Finder") { [weak self] in self?.message = FinderPowerService.createFile(named: "New File") },
+            Command(title: "Show Storage", subtitle: "Inspect disk capacity and usage", icon: "internaldrive", category: "System") { [weak self] in self?.showStorage() },
+            Command(title: "Inspect Clipboard", subtitle: "Classify the current clipboard locally", icon: "doc.on.clipboard", category: "Intelligence") { [weak self] in self?.inspectClipboard() },
+            Command(title: "Audio Controls", subtitle: "Mute or change system output volume", icon: "speaker.wave.2", category: "Audio") { [weak self] in self?.message = AudioRulesStore.outputSummary() },
+            Command(title: "Mac Timeline", subtitle: "See recent application and display changes", icon: "clock.arrow.circlepath", category: "Intelligence") { [weak self] in self?.openControlCenter() },
+            Command(title: "Control Center", subtitle: "Open every MacPilot module", icon: "square.grid.2x2", category: "System") { [weak self] in self?.openControlCenter() },
             Command(title: "Accessibility Permission", subtitle: "Allow MacPilot to control windows", icon: "hand.raised", category: "System") { WindowManager.requestAccessibility() },
             Command(title: "Open Settings", subtitle: "Configure MacPilot", icon: "gearshape", category: "System") { [weak self] in self?.openSettings() }
         ]
@@ -169,7 +184,7 @@ final class CommandModel: ObservableObject {
 
     var filtered: [Command] {
         let clean = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !clean.isEmpty else { return Array(commands.prefix(7)) }
+        guard !clean.isEmpty else { return Array(commands.prefix(9)) }
         let terms = clean.lowercased().split(separator: " ")
         return commands.filter { command in
             let haystack = "\(command.title) \(command.subtitle) \(command.category)".lowercased()
@@ -178,9 +193,16 @@ final class CommandModel: ObservableObject {
     }
 
     var parsedIntent: IntentParser.Intent { IntentParser.parse(query) }
-    func beginSession() { query = ""; message = nil; isBusy = false; workspaceCount = workspaceStore.workspaces.count }
+
+    func beginSession() {
+        query = ""
+        message = nil
+        isBusy = false
+        workspaceCount = workspaceStore.workspaces.count
+    }
 
     func executeFirst() {
+        let submitted = query
         switch parsedIntent {
         case .restore(let name): restoreWorkspace(name: name)
         case .save(let name): saveWorkspace(name: name)
@@ -189,9 +211,10 @@ final class CommandModel: ObservableObject {
         case .copyPath: copyPath()
         case .storage: showStorage()
         case .settings: openSettings()
-        case .accessibility: WindowManager.requestAccessibility()
+        case .accessibility: WindowManager.requestAccessibility(); message = "Accessibility request sent"
         case .unknown: filtered.first?.action()
         }
+        if let result = message { CommandHistoryStore.shared.record(query: submitted, result: result); TimelineStore.shared.add(.command, title: submitted, detail: result) }
     }
 
     private func restoreWorkspace(name: String? = nil) {
@@ -215,6 +238,8 @@ final class CommandModel: ObservableObject {
     private func copyPath() { message = FinderService.copySelectedPath().map { "Copied \($0)" } ?? "Select a file or folder in Finder first" }
     private func showStorage() { lastStorage = StorageService.volumeInfo(); guard let storage = lastStorage else { message = "Storage information unavailable"; return }; message = "\(ByteCountFormatter.string(fromByteCount: storage.free, countStyle: .file)) free of \(ByteCountFormatter.string(fromByteCount: storage.total, countStyle: .file))" }
     private func moveApp(named name: String, toMonitor monitor: Int) { message = WindowManager.moveApp(named: name, toMonitor: monitor) }
+    private func inspectClipboard() { message = ClipboardIntelligence.inspect().map { "\($0.label): \($0.action)" } ?? "Clipboard is empty" }
+    private func openControlCenter() { ControlCenterController.shared.show() }
     private func openSettings() { SettingsWindowController.shared.show() }
 }
 
@@ -288,15 +313,16 @@ struct SettingsView: View {
             Section("MacPilot") {
                 LabeledContent("Global shortcut", value: "⌘⇧Space")
                 LabeledContent("Architecture", value: "Native SwiftUI + AppKit")
-                LabeledContent("Version", value: "0.2 MVP")
+                LabeledContent("Features", value: "Workspaces, Finder, Audio, Storage, Timeline")
+                LabeledContent("Version", value: "0.3")
             }
             Section("Permissions") {
-                Text("Accessibility access lets MacPilot capture, move and restore application windows.")
+                Text("Accessibility controls application windows. Finder automation is used for explicit Finder actions. Audio rules use system volume controls.")
                     .foregroundStyle(.secondary)
                 Button("Request Accessibility Access") { WindowManager.requestAccessibility() }
             }
             Section("Privacy") {
-                Text("Workspace snapshots are stored locally.")
+                Text("Workspaces, command history, timeline events, clipboard classification results, and automation rules are stored locally. Sensitive clipboard content is never persisted by MacPilot.")
                     .foregroundStyle(.secondary)
             }
         }
