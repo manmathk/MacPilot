@@ -1,0 +1,17 @@
+name: macOS Build
+
+on:
+  push:
+    branches: ["main", "feature/**"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Swift
+        run: swift --version
+      - name: Build
+        run: swift build -v
