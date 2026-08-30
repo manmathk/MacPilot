@@ -23,8 +23,7 @@ struct CGRectCodable: Codable, Hashable {
     let height: Double
 
     init(_ rect: CGRect) {
-        x = rect.origin.x; y = rect.origin.y
-        width = rect.size.width; height = rect.size.height
+        x = rect.origin.x; y = rect.origin.y; width = rect.width; height = rect.height
     }
 
     var cgRect: CGRect { CGRect(x: x, y: y, width: width, height: height) }
@@ -49,7 +48,7 @@ enum WindowManager {
 
     static func requestAccessibility() {
         let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
-        AXIsProcessTrustedWithOptions([key: true] as CFDictionary)
+        _ = AXIsProcessTrustedWithOptions([key: true] as CFDictionary)
     }
 
     static func captureWorkspace() -> [WindowSnapshot] {
@@ -73,29 +72,19 @@ enum WindowManager {
             requestAccessibility()
             return .init(restored: 0, failed: workspace.windows.count, offscreen: 0)
         }
-
-        var restored = 0
-        var failed = 0
-        var offscreen = 0
+        var restored = 0, failed = 0, offscreen = 0
         let grouped = Dictionary(grouping: workspace.windows, by: { $0.bundleIdentifier })
-
         for (bundleID, desiredWindows) in grouped {
-            guard let app = await ensureRunning(bundleID: bundleID) else {
-                failed += desiredWindows.count
-                continue
-            }
+            guard let app = await ensureRunning(bundleID: bundleID) else { failed += desiredWindows.count; continue }
             app.activate(options: [.activateIgnoringOtherApps])
             let axApp = AXUIElementCreateApplication(app.processIdentifier)
-            guard let current = attribute(axApp, kAXWindowsAttribute) as? [AXUIElement] else {
-                failed += desiredWindows.count
-                continue
-            }
+            guard let current = attribute(axApp, kAXWindowsAttribute) as? [AXUIElement] else { failed += desiredWindows.count; continue }
             var remaining = current
             for desired in desiredWindows {
                 guard let index = bestMatch(in: remaining, desired: desired) else { failed += 1; continue }
                 let window = remaining.remove(at: index)
                 if !visible(desired.frame.cgRect) { offscreen += 1 }
-                setFrame(of: window, to: visibleRect(desired.frame.cgRect)) ? (restored += 1) : (failed += 1)
+                if setFrame(of: window, to: visibleRect(desired.frame.cgRect)) { restored += 1 } else { failed += 1 }
             }
         }
         return .init(restored: restored, failed: failed, offscreen: offscreen)
@@ -127,15 +116,14 @@ enum WindowManager {
     }
 
     private static func frame(of element: AXUIElement) -> CGRect? {
-        guard let p = attribute(element, kAXPositionAttribute) as? AXValue,
-              let s = attribute(element, kAXSizeAttribute) as? AXValue else { return nil }
-        var point = CGPoint.zero; var size = CGSize.zero
+        guard let p = attribute(element, kAXPositionAttribute) as? AXValue, let s = attribute(element, kAXSizeAttribute) as? AXValue else { return nil }
+        var point = CGPoint.zero, size = CGSize.zero
         guard AXValueGetValue(p, .cgPoint, &point), AXValueGetValue(s, .cgSize, &size) else { return nil }
         return CGRect(origin: point, size: size)
     }
 
     private static func setFrame(of element: AXUIElement, to rect: CGRect) -> Bool {
-        var point = rect.origin; var size = rect.size
+        var point = rect.origin, size = rect.size
         guard let p = AXValueCreate(.cgPoint, &point), let s = AXValueCreate(.cgSize, &size) else { return false }
         let pr = AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, p)
         let sr = AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, s)
@@ -148,9 +136,7 @@ enum WindowManager {
         return value as AnyObject?
     }
 
-    private static func visible(_ rect: CGRect) -> Bool {
-        NSScreen.screens.contains { $0.visibleFrame.intersects(rect) }
-    }
+    private static func visible(_ rect: CGRect) -> Bool { NSScreen.screens.contains { $0.visibleFrame.intersects(rect) } }
 
     private static func visibleRect(_ rect: CGRect) -> CGRect {
         guard !visible(rect), let screen = NSScreen.main else { return rect }
@@ -185,7 +171,7 @@ enum FinderService {
             end try
         end tell
         """
-        guard let value = execute(script) else { return nil }
+        guard let value = execute(script), !value.isEmpty else { return nil }
         return URL(fileURLWithPath: value.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
@@ -199,7 +185,8 @@ enum FinderService {
     static func openTerminalHere() -> Bool {
         guard let directory = currentDirectory() else { return false }
         let escaped = directory.path.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
-        let script = "tell application \"Terminal\" to do script \"cd \\\"\(escaped)\\\"\""
+        let command = "cd \"\(escaped)\""
+        let script = "tell application \"Terminal\" to do script \"\(command)\""
         return execute(script) != nil
     }
 
@@ -212,22 +199,17 @@ enum FinderService {
 }
 
 enum StorageService {
-    struct VolumeInfo {
-        let total: Int64
-        let free: Int64
-    }
+    struct VolumeInfo { let total: Int64; let free: Int64 }
 
     static func volumeInfo() -> VolumeInfo {
         let attrs = (try? FileManager.default.attributesOfFileSystem(forPath: "/")) ?? [:]
-        return VolumeInfo(total: (attrs[.systemSize] as? NSNumber)?.int64Value ?? 0,
-                          free: (attrs[.systemFreeSize] as? NSNumber)?.int64Value ?? 0)
+        return .init(total: (attrs[.systemSize] as? NSNumber)?.int64Value ?? 0, free: (attrs[.systemFreeSize] as? NSNumber)?.int64Value ?? 0)
     }
 
     static func topLevelItems() -> [(name: String, bytes: Int64)] {
         let urls = (try? FileManager.default.contentsOfDirectory(at: URL(fileURLWithPath: "/"), includingPropertiesForKeys: [.totalFileAllocatedSizeKey], options: [.skipsHiddenFiles])) ?? []
         return urls.compactMap { url in
-            let value = try? url.resourceValues(forKeys: [.totalFileAllocatedSizeKey]).totalFileAllocatedSize
-            guard let bytes = value, bytes > 0 else { return nil }
+            guard let bytes = try? url.resourceValues(forKeys: [.totalFileAllocatedSizeKey]).totalFileAllocatedSize, bytes > 0 else { return nil }
             return (url.lastPathComponent, Int64(bytes))
         }.sorted { $0.bytes > $1.bytes }
     }
@@ -252,30 +234,33 @@ enum IntentParser {
         if (q.contains("save") || q.contains("create")) && q.contains("workspace") { return .save(name(in: q)) }
         if q.contains("terminal") && (q.contains("here") || q.contains("folder")) { return .terminal }
         if q.contains("copy") && q.contains("path") { return .copyPath }
-        if q.contains("storage") || q.contains("disk space") { return .storage }
+        if q.contains("storage") || q.contains("disk space") || q == "disk" { return .storage }
         if q.contains("accessibility") || q.contains("permission") { return .accessibility }
         if q.contains("settings") || q == "preferences" { return .settings }
-        if let m = move(q) { return m }
+        if let intent = move(q) { return intent }
         return .unknown
     }
 
     private static func name(in q: String) -> String? {
         for marker in ["named ", "called "] {
-            if let range = q.range(of: marker) {
-                let value = q[range.upperBound...].trimmingCharacters(in: .whitespaces)
-                if !value.isEmpty { return value.capitalized }
-            }
+            guard let range = q.range(of: marker) else { continue }
+            let value = q[range.upperBound...].trimmingCharacters(in: .whitespaces)
+            if !value.isEmpty { return value.capitalized }
         }
         return nil
     }
 
     private static func move(_ q: String) -> Intent? {
-        guard q.contains("move"), let monitorRange = q.range(of: "monitor") else { return nil }
-        let before = q[..<monitorRange.lowerBound]
-        guard let number = Int(before.split(separator: " ").last ?? "") else { return nil }
-        let appName = q.replacingOccurrences(of: "move ", with: "")
-            .components(separatedBy: " to ").first?.trimmingCharacters(in: .whitespaces) ?? ""
-        guard !appName.isEmpty else { return nil }
-        return .moveApp(appName.capitalized, number)
+        guard q.hasPrefix("move ") else { return nil }
+        let phrases = [" to monitor ", " to my monitor ", " to my second monitor", " to my third monitor"]
+        for phrase in phrases {
+            if let range = q.range(of: phrase) {
+                let appName = String(q[q.index(q.startIndex, offsetBy: 5)..<range.lowerBound]).trimmingCharacters(in: .whitespaces)
+                let suffix = q[range.upperBound...]
+                let number = phrase.contains("second") ? 2 : (phrase.contains("third") ? 3 : Int(suffix.split(separator: " ").first ?? "1") ?? 1)
+                if !appName.isEmpty { return .moveApp(appName.capitalized, number) }
+            }
+        }
+        return nil
     }
 }
