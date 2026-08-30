@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import Combine
 
 @main
 struct MacPilotApp: App {
@@ -8,7 +9,7 @@ struct MacPilotApp: App {
     var body: some Scene {
         Settings {
             SettingsView()
-                .frame(width: 520, height: 420)
+                .frame(width: 560, height: 460)
         }
     }
 }
@@ -16,28 +17,52 @@ struct MacPilotApp: App {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var panelController: CommandPanelController!
-    private var hotKeyMonitor: Any?
+    private var globalHotKeyMonitor: Any?
+    private var localHotKeyMonitor: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        setupMenuBar()
+        panelController = CommandPanelController()
+        installHotKey()
+    }
 
+    private func setupMenuBar() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.button?.image = NSImage(systemSymbolName: "scope", accessibilityDescription: "MacPilot")
-        statusItem.button?.target = self
-        statusItem.button?.action = #selector(togglePanel)
+        statusItem.menu = NSMenu()
 
-        let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "Open MacPilot", action: #selector(togglePanel), keyEquivalent: ""))
-        menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ","))
-        menu.addItem(NSMenuItem(title: "Quit MacPilot", action: #selector(quit), keyEquivalent: "q"))
-        statusItem.menu = menu
+        let open = NSMenuItem(title: "Open MacPilot", action: #selector(togglePanel), keyEquivalent: "")
+        open.target = self
+        statusItem.menu?.addItem(open)
 
-        panelController = CommandPanelController()
+        let workspace = NSMenuItem(title: "Save Workspace…", action: #selector(saveWorkspace), keyEquivalent: "")
+        workspace.target = self
+        statusItem.menu?.addItem(workspace)
 
-        hotKeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard event.modifierFlags.contains([.command, .shift]), event.charactersIgnoringModifiers == " " else { return }
+        statusItem.menu?.addItem(.separator())
+
+        let settings = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
+        settings.target = self
+        statusItem.menu?.addItem(settings)
+
+        let quit = NSMenuItem(title: "Quit MacPilot", action: #selector(quit), keyEquivalent: "q")
+        quit.target = self
+        statusItem.menu?.addItem(quit)
+    }
+
+    private func installHotKey() {
+        let handler: (NSEvent) -> Void = { [weak self] event in
+            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            guard flags.contains([.command, .shift]), event.keyCode == 49 else { return }
             self?.togglePanel()
+        }
+        globalHotKeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown, handler: handler)
+        localHotKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            handler(event)
+            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            if flags.contains([.command, .shift]), event.keyCode == 49 { return nil }
+            return event
         }
     }
 
@@ -45,9 +70,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panelController.toggle()
     }
 
+    @objc private func saveWorkspace() {
+        panelController.presentSaveWorkspace()
+    }
+
     @objc private func openSettings() {
         NSApp.activate(ignoringOtherApps: true)
-        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+        NSApp.sendAction(#selector(NSApplication.showSettingsWindow(_:)), to: nil, from: nil)
     }
 
     @objc private func quit() {
@@ -55,23 +84,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        if let monitor = hotKeyMonitor {
-            NSEvent.removeMonitor(monitor)
-        }
+        if let monitor = globalHotKeyMonitor { NSEvent.removeMonitor(monitor) }
+        if let monitor = localHotKeyMonitor { NSEvent.removeMonitor(monitor) }
     }
 }
 
-final class CommandPanelController {
+@MainActor
+final class CommandPanelController: NSObject {
     private let panel: NSPanel
-    private let model = CommandModel()
+    private let model: CommandModel
 
-    init() {
+    override init() {
+        model = CommandModel()
         panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 720, height: 520),
+            contentRect: NSRect(x: 0, y: 0, width: 760, height: 540),
             styleMask: [.titled, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
+        super.init()
         panel.titleVisibility = .hidden
         panel.titlebarAppearsTransparent = true
         panel.isOpaque = false
@@ -79,6 +110,7 @@ final class CommandPanelController {
         panel.level = .floating
         panel.hidesOnDeactivate = true
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.isMovableByWindowBackground = true
         panel.contentView = NSHostingView(rootView: CommandPaletteView(model: model))
     }
 
@@ -87,18 +119,24 @@ final class CommandPanelController {
             panel.orderOut(nil)
             return
         }
+        show()
+    }
 
-        model.reset()
-        let screen = NSScreen.main ?? NSScreen.screens.first
-        if let screen {
-            let visible = screen.visibleFrame
-            panel.setFrameOrigin(NSPoint(
-                x: visible.midX - panel.frame.width / 2,
-                y: visible.midY - panel.frame.height / 2 + 80
-            ))
+    func show() {
+        model.beginSession()
+        let target = NSScreen.main ?? NSScreen.screens.first
+        if let target {
+            let frame = target.visibleFrame
+            panel.setFrameOrigin(NSPoint(x: frame.midX - panel.frame.width / 2, y: frame.midY - panel.frame.height / 2 + 80))
         }
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
+        panel.makeFirstResponder(panel.contentView)
+    }
+
+    func presentSaveWorkspace() {
+        show()
+        model.query = "Create workspace called "
     }
 }
 
@@ -115,23 +153,28 @@ final class CommandModel: ObservableObject {
 
     @Published var query = ""
     @Published var message: String?
+    @Published var isBusy = false
+    @Published var lastStorage: StorageService.VolumeInfo?
+    @Published var workspaceCount = 0
 
+    private let workspaceStore = WorkspaceStore()
     private(set) var commands: [Command] = []
 
     init() {
         commands = [
-            Command(title: "Restore Coding Workspace", subtitle: "Bring your coding windows back", icon: "rectangle.3.group", category: "Workspaces", action: { [weak self] in self?.restoreWorkspace() }),
-            Command(title: "Create Workspace from Current Setup", subtitle: "Save your current window arrangement", icon: "square.and.arrow.down", category: "Workspaces", action: { [weak self] in self?.saveWorkspace() }),
-            Command(title: "Open Terminal Here", subtitle: "Open Terminal at the focused Finder folder", icon: "terminal", category: "Finder", action: { [weak self] in self?.openTerminalHere() }),
-            Command(title: "Copy Selected File Path", subtitle: "Copy the path of the selected Finder item", icon: "link", category: "Finder", action: { [weak self] in self?.copyPath() }),
-            Command(title: "Show Storage", subtitle: "See a storage overview for this Mac", icon: "internaldrive", category: "System", action: { [weak self] in self?.showStorage() }),
-            Command(title: "Mute Current App", subtitle: "Open audio controls for the active application", icon: "speaker.slash", category: "Audio", action: { [weak self] in self?.showAudio() })
+            Command(title: "Restore Workspace", subtitle: "Restore a saved window arrangement", icon: "rectangle.3.group", category: "Workspaces") { [weak self] in self?.restoreWorkspace() },
+            Command(title: "Create Workspace from Current Setup", subtitle: "Capture apps, windows, sizes and positions", icon: "square.and.arrow.down", category: "Workspaces") { [weak self] in self?.saveWorkspace() },
+            Command(title: "Open Terminal Here", subtitle: "Use the frontmost Finder folder", icon: "terminal", category: "Finder") { [weak self] in self?.openTerminalHere() },
+            Command(title: "Copy Selected File Path", subtitle: "Copy the selected Finder item path", icon: "link", category: "Finder") { [weak self] in self?.copyPath() },
+            Command(title: "Show Storage", subtitle: "Inspect disk capacity and top-level usage", icon: "internaldrive", category: "System") { [weak self] in self?.showStorage() },
+            Command(title: "Accessibility Permission", subtitle: "Allow MacPilot to control windows", icon: "hand.raised", category: "System") { WindowManager.requestAccessibility() },
+            Command(title: "Open Settings", subtitle: "Configure MacPilot", icon: "gearshape", category: "System") { [weak self] in self?.openSettings() }
         ]
     }
 
     var filtered: [Command] {
         let clean = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !clean.isEmpty else { return Array(commands.prefix(6)) }
+        guard !clean.isEmpty else { return Array(commands.prefix(7)) }
         let terms = clean.lowercased().split(separator: " ")
         return commands.filter { command in
             let haystack = "\(command.title) \(command.subtitle) \(command.category)".lowercased()
@@ -139,59 +182,111 @@ final class CommandModel: ObservableObject {
         }
     }
 
-    func reset() {
+    var parsedIntent: IntentParser.Intent { IntentParser.parse(query) }
+
+    func beginSession() {
         query = ""
         message = nil
+        isBusy = false
+        workspaceCount = workspaceStore.workspaces.count
+    }
+
+    func executeFirst() {
+        switch parsedIntent {
+        case .restore(let name): restoreWorkspace(name: name)
+        case .save(let name): saveWorkspace(name: name)
+        case .moveApp(let appName, let monitor): moveApp(named: appName, toMonitor: monitor)
+        case .terminal: openTerminalHere()
+        case .copyPath: copyPath()
+        case .storage: showStorage()
+        case .settings: openSettings()
+        case .accessibility: WindowManager.requestAccessibility()
+        case .unknown: filtered.first?.action()
+        }
+    }
+
+    private func restoreWorkspace(name: String? = nil) {
+        guard let workspace = workspaceStore.workspaces.first(where: { name == nil || $0.name.caseInsensitiveCompare(name!) == .orderedSame }) ?? workspaceStore.workspaces.first else {
+            message = "No saved workspaces yet"
+            return
+        }
+        guard WindowManager.isAccessibilityTrusted else {
+            message = "Accessibility permission is required to restore windows"
+            WindowManager.requestAccessibility()
+            return
+        }
+        isBusy = true
+        Task { [weak self] in
+            guard let self else { return }
+            let result = await self.workspaceStore.restore(workspace)
+            self.message = result.failed == 0
+                ? "Restored \(result.restored) windows"
+                : "Restored \(result.restored), \(result.failed) could not be restored"
+            if result.offscreen > 0 { self.message = "Restored \(result.restored); \(result.offscreen) moved back on-screen" }
+            self.isBusy = false
+        }
+    }
+
+    private func saveWorkspace(name: String? = nil) {
+        let workspaceName = (name?.isEmpty == false ? name! : "Workspace \(workspaceStore.workspaces.count + 1)").trimmingCharacters(in: .whitespaces)
+        guard WindowManager.isAccessibilityTrusted else {
+            message = "Accessibility permission is required to capture windows"
+            WindowManager.requestAccessibility()
+            return
+        }
+        let snapshot = workspaceStore.saveCurrent(named: workspaceName)
+        workspaceCount = workspaceStore.workspaces.count
+        message = snapshot.windows.isEmpty ? "Saved, but no accessible windows were captured" : "Saved \(snapshot.windows.count) windows as \(workspaceName)"
     }
 
     private func openTerminalHere() {
-        let script = "tell application \"Terminal\" to activate"
-        executeAppleScript(script)
-        message = "Terminal opened"
+        message = FinderService.openTerminalHere() ? "Terminal opened in Finder's current folder" : "Couldn't read the frontmost Finder folder"
     }
 
     private func copyPath() {
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        if let file = NSOpenPanel.selectURL() {
-            pasteboard.setString(file.path, forType: .string)
-            message = "Path copied"
+        if let path = FinderService.copySelectedPath() {
+            message = "Copied \(path)"
         } else {
-            message = "Select a Finder item first"
+            message = "Select a file or folder in Finder first"
         }
-    }
-
-    private func restoreWorkspace() {
-        WorkspaceManager.restoreDefaultCodingWorkspace()
-        message = "Coding workspace restored"
-    }
-
-    private func saveWorkspace() {
-        WorkspaceManager.saveCurrentWorkspace(named: "Coding")
-        message = "Workspace saved"
     }
 
     private func showStorage() {
-        let bytes = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first.flatMap { url -> Int64? in
-            do { return try FileManager.default.attributesOfFileSystem(forPath: url.path)[.systemFreeSize] as? Int64 } catch { return nil }
-        }
-        if let bytes {
-            let formatter = ByteCountFormatter()
-            formatter.countStyle = .file
-            message = "Free space: \(formatter.string(fromByteCount: bytes))"
-        } else {
-            message = "Storage information unavailable"
-        }
+        lastStorage = StorageService.volumeInfo()
+        let formatter = ByteCountFormatter(); formatter.countStyle = .file
+        guard let storage = lastStorage else { message = "Storage information unavailable"; return }
+        let free = formatter.string(fromByteCount: storage.free)
+        let total = formatter.string(fromByteCount: storage.total)
+        message = "\(free) free of \(total)"
     }
 
-    private func showAudio() {
-        message = "Audio controls are available in the next MVP module"
+    private func moveApp(named name: String, toMonitor monitor: Int) {
+        guard WindowManager.isAccessibilityTrusted else {
+            message = "Accessibility permission is required to move windows"
+            WindowManager.requestAccessibility()
+            return
+        }
+        let apps = NSWorkspace.shared.runningApplications.filter { $0.activationPolicy == .regular }
+        guard let app = apps.first(where: { ($0.localizedName ?? "").localizedCaseInsensitiveContains(name) }) else {
+            message = "Couldn't find \(name)"
+            return
+        }
+        let screens = NSScreen.screens
+        guard monitor > 0, monitor <= screens.count else { message = "Monitor \(monitor) isn't available"; return }
+        let target = screens[monitor - 1].visibleFrame
+        let axApp = AXUIElementCreateApplication(app.processIdentifier)
+        guard let windows = AXHelper.windows(of: axApp), let window = windows.first,
+              AXHelper.setPosition(of: window, to: CGPoint(x: target.minX + 24, y: target.maxY - 24 - 600)) else {
+            message = "Couldn't move \(name)'s window"
+            return
+        }
+        app.activate(options: [.activateIgnoringOtherApps])
+        message = "Moved \(name) to monitor \(monitor)"
     }
 
-    private func executeAppleScript(_ source: String) {
-        guard let script = NSAppleScript(source: source) else { return }
-        var error: NSDictionary?
-        script.executeAndReturnError(&error)
+    private func openSettings() {
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.sendAction(#selector(NSApplication.showSettingsWindow(_:)), to: nil, from: nil)
     }
 }
 
@@ -202,17 +297,16 @@ struct CommandPaletteView: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
-                Image(systemName: "scope")
-                    .font(.system(size: 19, weight: .semibold))
+                Image(systemName: model.isBusy ? "arrow.triangle.2.circlepath" : "scope")
+                    .symbolEffect(.pulse, options: .repeating, isActive: model.isBusy)
+                    .font(.system(size: 18, weight: .semibold))
                     .foregroundStyle(.secondary)
 
                 TextField("What do you want to do?", text: $model.query)
                     .textFieldStyle(.plain)
-                    .font(.system(size: 20, weight: .regular))
+                    .font(.system(size: 20))
                     .focused($focused)
-                    .onSubmit {
-                        model.filtered.first?.action()
-                    }
+                    .onSubmit { model.executeFirst() }
 
                 Text("⌘⇧Space")
                     .font(.caption.monospaced())
@@ -222,61 +316,37 @@ struct CommandPaletteView: View {
 
             Divider()
 
-            if model.filtered.isEmpty {
-                VStack(spacing: 10) {
-                    Image(systemName: "magnifyingglass")
-                        .font(.system(size: 28))
+            if model.query.isEmpty {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Suggested")
+                        .font(.caption.weight(.semibold))
                         .foregroundStyle(.secondary)
-                    Text("No matching commands")
-                        .font(.headline)
-                    Text("Try “restore workspace”, “terminal”, or “storage”.")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                ScrollView {
-                    LazyVStack(spacing: 4) {
-                        ForEach(model.filtered) { command in
-                            Button {
-                                command.action()
-                            } label: {
-                                HStack(spacing: 14) {
-                                    Image(systemName: command.icon)
-                                        .frame(width: 30)
-                                        .font(.system(size: 16, weight: .semibold))
-                                        .foregroundStyle(.primary)
-
-                                    VStack(alignment: .leading, spacing: 3) {
-                                        Text(command.title)
-                                            .font(.system(size: 15, weight: .medium))
-                                        Text(command.subtitle)
-                                            .font(.system(size: 12))
-                                            .foregroundStyle(.secondary)
-                                    }
-
-                                    Spacer()
-
-                                    Text(command.category)
-                                        .font(.caption)
-                                        .foregroundStyle(.tertiary)
-                                }
-                                .padding(.horizontal, 14)
-                                .padding(.vertical, 10)
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                        }
+                    commandList
+                    HStack {
+                        Label("\(model.workspaceCount) saved workspaces", systemImage: "rectangle.3.group")
+                        Spacer()
+                        Text("Type naturally to run commands")
+                            .foregroundStyle(.tertiary)
                     }
-                    .padding(8)
+                    .font(.caption)
                 }
+                .padding(12)
+            } else {
+                commandList
+                    .frame(maxHeight: .infinity)
+            }
+
+            if let storage = model.lastStorage, model.query.lowercased().contains("storage") {
+                StorageCard(storage: storage)
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 8)
             }
 
             if let message = model.message {
                 Divider()
-                HStack {
-                    Image(systemName: "checkmark.circle.fill")
-                    Text(message)
+                HStack(spacing: 8) {
+                    Image(systemName: message.lowercased().contains("couldn't") ? "exclamationmark.circle" : "checkmark.circle.fill")
+                    Text(message).lineLimit(2)
                     Spacer()
                 }
                 .font(.system(size: 12, weight: .medium))
@@ -286,12 +356,54 @@ struct CommandPaletteView: View {
         }
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .stroke(.primary.opacity(0.08), lineWidth: 1)
-        }
+        .overlay { RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(.primary.opacity(0.08), lineWidth: 1) }
         .shadow(radius: 30, y: 14)
         .onAppear { focused = true }
+    }
+
+    private var commandList: some View {
+        ScrollView {
+            LazyVStack(spacing: 4) {
+                ForEach(model.filtered) { command in
+                    Button(action: command.action) {
+                        HStack(spacing: 14) {
+                            Image(systemName: command.icon)
+                                .frame(width: 30)
+                                .font(.system(size: 15, weight: .semibold))
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(command.title).font(.system(size: 14, weight: .medium))
+                                Text(command.subtitle).font(.system(size: 12)).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Text(command.category).font(.caption).foregroundStyle(.tertiary)
+                        }
+                        .padding(.horizontal, 12).padding(.vertical, 9)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .background(.primary.opacity(0.0001), in: RoundedRectangle(cornerRadius: 10))
+                }
+            }
+            .padding(8)
+        }
+    }
+}
+
+struct StorageCard: View {
+    let storage: StorageService.VolumeInfo
+    var body: some View {
+        let total = Double(max(storage.total, 1))
+        let used = max(0, total - Double(storage.free))
+        VStack(alignment: .leading, spacing: 8) {
+            HStack { Text("Storage").font(.headline); Spacer(); Text(ByteCountFormatter.string(fromByteCount: storage.free, countStyle: .file) + " free").foregroundStyle(.secondary) }
+            GeometryReader { proxy in
+                Capsule().fill(.quaternary).overlay(alignment: .leading) {
+                    Capsule().fill(.primary.opacity(0.75)).frame(width: proxy.size.width * CGFloat(min(used / total, 1)))
+                }
+            }.frame(height: 7)
+        }
+        .padding(12)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
     }
 }
 
@@ -300,10 +412,16 @@ struct SettingsView: View {
         Form {
             Section("MacPilot") {
                 LabeledContent("Global shortcut", value: "⌘⇧Space")
-                LabeledContent("Version", value: "0.1 MVP")
+                LabeledContent("Architecture", value: "Native SwiftUI + AppKit")
+                LabeledContent("Version", value: "0.2 MVP")
+            }
+            Section("Permissions") {
+                Text("Accessibility access lets MacPilot capture, move and restore application windows. Finder automation is used only for explicit Finder commands.")
+                    .foregroundStyle(.secondary)
+                Button("Request Accessibility Access") { WindowManager.requestAccessibility() }
             }
             Section("Privacy") {
-                Text("MacPilot is designed to keep command history and workspace data local to your Mac.")
+                Text("Workspace snapshots and command state are stored locally in UserDefaults. No account or cloud service is required by the MVP.")
                     .foregroundStyle(.secondary)
             }
         }
@@ -311,28 +429,39 @@ struct SettingsView: View {
     }
 }
 
-enum WorkspaceManager {
-    static func saveCurrentWorkspace(named name: String) {
-        let workspace = NSWorkspace.shared.runningApplications
-            .filter { $0.activationPolicy == .regular }
-            .compactMap { $0.bundleIdentifier }
-        UserDefaults.standard.set(workspace, forKey: "workspace.\(name).bundleIDs")
+@MainActor
+final class WorkspaceStore: ObservableObject {
+    @Published private(set) var workspaces: [WorkspaceSnapshot] = []
+    private let key = "MacPilot.workspaces.v2"
+
+    init() {
+        if let data = UserDefaults.standard.data(forKey: key), let value = try? JSONDecoder().decode([WorkspaceSnapshot].self, from: data) { workspaces = value }
     }
 
-    static func restoreDefaultCodingWorkspace() {
-        let apps = UserDefaults.standard.stringArray(forKey: "workspace.Coding.bundleIDs") ?? ["com.apple.Terminal", "com.apple.finder"]
-        for bundleID in apps {
-            NSWorkspace.shared.launchApplication(withBundleIdentifier: bundleID, options: [.default], additionalEventParamDescriptor: nil, launchIdentifier: nil)
-        }
+    func saveCurrent(named name: String) -> WorkspaceSnapshot {
+        let snapshot = WorkspaceSnapshot(id: UUID(), name: name, windows: WindowManager.captureWorkspace(), createdAt: Date(), updatedAt: Date())
+        if let index = workspaces.firstIndex(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame }) { workspaces[index] = snapshot } else { workspaces.append(snapshot) }
+        persist()
+        return snapshot
     }
+
+    func restore(_ workspace: WorkspaceSnapshot) async -> WorkspaceRestoreResult { await WindowManager.restore(workspace) }
+
+    private func persist() { if let data = try? JSONEncoder().encode(workspaces) { UserDefaults.standard.set(data, forKey: key) } }
 }
 
-private extension NSOpenPanel {
-    static func selectURL() -> URL? {
-        let panel = NSOpenPanel()
-        panel.allowsMultipleSelection = false
-        panel.canChooseDirectories = false
-        panel.canChooseFiles = true
-        return panel.runModal() == .OK ? panel.url : nil
+private enum AXHelper {
+    static func windows(of app: AXUIElement) -> [AXUIElement]? { attribute(app, kAXWindowsAttribute) as? [AXUIElement] }
+
+    static func setPosition(of window: AXUIElement, to point: CGPoint) -> Bool {
+        var value = point
+        guard let axValue = AXValueCreate(.cgPoint, &value) else { return false }
+        return AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, axValue) == .success
+    }
+
+    private static func attribute(_ element: AXUIElement, _ key: String) -> AnyObject? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, key as CFString, &value) == .success else { return nil }
+        return value as AnyObject?
     }
 }
