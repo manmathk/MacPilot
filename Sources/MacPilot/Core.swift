@@ -12,8 +12,13 @@ struct WindowSnapshot: Codable, Identifiable {
     let height: Double
 
     init(bundleIdentifier: String, title: String, frame: CGRect) {
-        id = UUID(); self.bundleIdentifier = bundleIdentifier; self.title = title
-        x = frame.origin.x; y = frame.origin.y; width = frame.width; height = frame.height
+        id = UUID()
+        self.bundleIdentifier = bundleIdentifier
+        self.title = title
+        x = frame.origin.x
+        y = frame.origin.y
+        width = frame.width
+        height = frame.height
     }
 
     var frame: CGRect { CGRect(x: x, y: y, width: width, height: height) }
@@ -33,12 +38,49 @@ struct WorkspaceRestoreResult {
     let offscreen: Int
 }
 
+struct WorkspaceStore {
+    private let key = "MacPilot.workspaces.v2"
+
+    var workspaces: [WorkspaceSnapshot] {
+        guard let data = UserDefaults.standard.data(forKey: key) else { return [] }
+        return (try? JSONDecoder().decode([WorkspaceSnapshot].self, from: data)) ?? []
+    }
+
+    func saveCurrent(named name: String) -> WorkspaceSnapshot {
+        let snapshot = WorkspaceSnapshot(id: UUID(), name: name, windows: WindowManager.captureWorkspace(), createdAt: Date(), updatedAt: Date())
+        var values = workspaces
+        if let index = values.firstIndex(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame }) {
+            values[index] = snapshot
+        } else {
+            values.append(snapshot)
+        }
+        if let data = try? JSONEncoder().encode(values) {
+            UserDefaults.standard.set(data, forKey: key)
+        }
+        return snapshot
+    }
+
+    func restore(_ workspace: WorkspaceSnapshot) -> WorkspaceRestoreResult {
+        WindowManager.restore(workspace)
+    }
+}
+
+@MainActor
+final class AXRuntime {
+    static let shared = AXRuntime()
+    private init() {}
+
+    func requestAccessibility() {
+        let options = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(options)
+    }
+}
+
 enum WindowManager {
     static var isAccessibilityTrusted: Bool { AXIsProcessTrusted() }
 
     static func requestAccessibility() {
-        let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
-        _ = AXIsProcessTrustedWithOptions([key: true] as CFDictionary)
+        Task { @MainActor in AXRuntime.shared.requestAccessibility() }
     }
 
     static func captureWorkspace() -> [WindowSnapshot] {
@@ -57,20 +99,32 @@ enum WindowManager {
         return result
     }
 
-    static func restore(_ workspace: WorkspaceSnapshot) async -> WorkspaceRestoreResult {
+    static func restore(_ workspace: WorkspaceSnapshot) -> WorkspaceRestoreResult {
         guard isAccessibilityTrusted else {
             requestAccessibility()
             return .init(restored: 0, failed: workspace.windows.count, offscreen: 0)
         }
-        var restored = 0, failed = 0, offscreen = 0
+        var restored = 0
+        var failed = 0
+        var offscreen = 0
+
         for (bundleID, desired) in Dictionary(grouping: workspace.windows, by: { $0.bundleIdentifier }) {
-            guard let app = await launchIfNeeded(bundleID: bundleID) else { failed += desired.count; continue }
+            guard let app = launchIfNeeded(bundleID: bundleID) else {
+                failed += desired.count
+                continue
+            }
             app.activate(options: [.activateIgnoringOtherApps])
             let axApp = AXUIElementCreateApplication(app.processIdentifier)
-            guard let current = attribute(axApp, kAXWindowsAttribute) as? [AXUIElement] else { failed += desired.count; continue }
+            guard let current = attribute(axApp, kAXWindowsAttribute) as? [AXUIElement] else {
+                failed += desired.count
+                continue
+            }
             var remaining = current
             for wanted in desired {
-                guard let index = remaining.indices.min(by: { score(remaining[$0], wanted) > score(remaining[$1], wanted) }) else { failed += 1; continue }
+                guard let index = remaining.indices.min(by: { score(remaining[$0], wanted) > score(remaining[$1], wanted) }) else {
+                    failed += 1
+                    continue
+                }
                 let window = remaining.remove(at: index)
                 let rect = wanted.frame
                 if !visible(rect) { offscreen += 1 }
@@ -80,13 +134,43 @@ enum WindowManager {
         return .init(restored: restored, failed: failed, offscreen: offscreen)
     }
 
-    private static func launchIfNeeded(bundleID: String) async -> NSRunningApplication? {
+    static func moveApp(named name: String, toMonitor monitor: Int) -> String {
+        guard isAccessibilityTrusted else {
+            requestAccessibility()
+            return "Accessibility permission is required to move windows"
+        }
+        let apps = NSWorkspace.shared.runningApplications.filter { $0.activationPolicy == .regular }
+        guard let app = apps.first(where: { ($0.localizedName ?? "").localizedCaseInsensitiveContains(name) }) else {
+            return "Couldn't find \(name)"
+        }
+        let screens = NSScreen.screens
+        guard monitor > 0 && monitor <= screens.count else { return "Monitor \(monitor) isn't available" }
+        let target = screens[monitor - 1].visibleFrame
+        let axApp = AXUIElementCreateApplication(app.processIdentifier)
+        guard let windows = attribute(axApp, kAXWindowsAttribute) as? [AXUIElement], let window = windows.first else {
+            return "Couldn't access \(name)'s window"
+        }
+        var point = CGPoint(x: target.minX + 24, y: target.maxY - 24 - min(target.height * 0.8, 720))
+        guard let position = AXValueCreate(.cgPoint, &point), AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, position) == .success else {
+            return "Couldn't move \(name)'s window"
+        }
+        app.activate(options: [.activateIgnoringOtherApps])
+        return "Moved \(name) to monitor \(monitor)"
+    }
+
+    private static func launchIfNeeded(bundleID: String) -> NSRunningApplication? {
         if let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first { return app }
         guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else { return nil }
-        do {
-            let config = NSWorkspace.OpenConfiguration(); config.activates = true
-            return try await NSWorkspace.shared.openApplication(at: url, configuration: config)
-        } catch { return nil }
+        let semaphore = DispatchSemaphore(value: 0)
+        var launched: NSRunningApplication?
+        let config = NSWorkspace.OpenConfiguration()
+        config.activates = true
+        NSWorkspace.shared.openApplication(at: url, configuration: config) { app, _ in
+            launched = app
+            semaphore.signal()
+        }
+        semaphore.wait()
+        return launched
     }
 
     private static func score(_ window: AXUIElement, _ desired: WindowSnapshot) -> Double {
@@ -97,34 +181,33 @@ enum WindowManager {
     }
 
     private static func frame(of element: AXUIElement) -> CGRect? {
-        guard let position = attribute(element, kAXPositionAttribute) as? AXValue,
-              let size = attribute(element, kAXSizeAttribute) as? AXValue else { return nil }
-        var point = CGPoint.zero; var dimensions = CGSize.zero
+        guard let position = attribute(element, kAXPositionAttribute), let size = attribute(element, kAXSizeAttribute) else { return nil }
+        var point = CGPoint.zero
+        var dimensions = CGSize.zero
         guard AXValueGetValue(position, .cgPoint, &point), AXValueGetValue(size, .cgSize, &dimensions) else { return nil }
         return CGRect(origin: point, size: dimensions)
     }
 
     private static func setFrame(of element: AXUIElement, to rect: CGRect) -> Bool {
-        var point = rect.origin; var size = rect.size
+        var point = rect.origin
+        var size = rect.size
         guard let position = AXValueCreate(.cgPoint, &point), let dimensions = AXValueCreate(.cgSize, &size) else { return false }
-        return AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, position) == .success &&
-               AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, dimensions) == .success
+        return AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, position) == .success && AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, dimensions) == .success
     }
 
-    private static func attribute(_ element: AXUIElement, _ key: String) -> AnyObject? {
+    private static func attribute(_ element: AXUIElement, _ key: String) -> CFTypeRef? {
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, key as CFString, &value) == .success else { return nil }
-        return value as AnyObject?
+        return value
     }
 
     private static func visible(_ rect: CGRect) -> Bool { NSScreen.screens.contains { $0.visibleFrame.intersects(rect) } }
 
     private static func visibleRect(_ rect: CGRect) -> CGRect {
         guard !visible(rect), let screen = NSScreen.main else { return rect }
-        var adjusted = rect
-        adjusted.origin.x = screen.visibleFrame.midX - rect.width / 2
-        adjusted.origin.y = screen.visibleFrame.midY - rect.height / 2
-        return adjusted
+        let maxX = screen.visibleFrame.maxX - min(rect.width, screen.visibleFrame.width)
+        let maxY = screen.visibleFrame.maxY - min(rect.height, screen.visibleFrame.height)
+        return CGRect(x: min(max(rect.minX, screen.visibleFrame.minX), maxX), y: min(max(rect.minY, screen.visibleFrame.minY), maxY), width: min(rect.width, screen.visibleFrame.width), height: min(rect.height, screen.visibleFrame.height))
     }
 }
 
@@ -158,7 +241,8 @@ enum FinderService {
 
     static func copySelectedPath() -> String? {
         guard let url = selectedURLs().first else { return nil }
-        NSPasteboard.general.clearContents(); NSPasteboard.general.setString(url.path, forType: .string)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(url.path, forType: .string)
         return url.path
     }
 
